@@ -18,7 +18,6 @@ config = DecoderOnlyModelConfig.from_json_file('./config.json')
 model = DecoderOnlyModelDecoder(config)  # 随机初始化，不加载 safetensors
 tokenizer = Qwen2TokenizerFast.from_pretrained('.')
 
-print(f"模型参数量: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
 # ========== 2. 准备数据 ==========
 
@@ -57,8 +56,15 @@ dataset = load_dataset(
 
 def tokenize_function(examples):
     # texts = examples
+    texts = [
+        tokenizer.apply_chat_template(
+                c,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+         for c in examples.get('conversations', examples.get('messages', []))]
     outputs = tokenizer(
-        examples["text"],
+        texts,
         truncation=True,
         max_length=2048,
         padding=False,  # 动态 padding，由 data_collator 处理
@@ -70,7 +76,7 @@ def tokenize_function(examples):
 tokenized_dataset = dataset.map(
     tokenize_function,
     batched=True,
-    remove_columns=["text"],
+    remove_columns=["conversations"],
 )
 
 # ========== 3. DataCollator（关键） ==========
@@ -83,10 +89,12 @@ data_collator = DataCollatorForLanguageModeling(
     mlm=False,  # 因果语言模型（不是 BERT 的 Masked LM）
     pad_to_multiple_of=8,  # 方便 fp16 加速
 )
-
+STEPS_PER_EPOCH = 1000 // (4 * 8)  # 3125
 # ========== 4. 训练参数 ==========
 args = TrainingArguments(
-    max_steps = int(10e4),
+    max_steps=STEPS_PER_EPOCH * 3,
+    logging_steps=STEPS_PER_EPOCH // 2,
+    save_steps=STEPS_PER_EPOCH,
     output_dir="./qwen2_pretrain",
     per_device_train_batch_size=4,      # 根据显存调整
     per_device_eval_batch_size=4,
@@ -96,12 +104,10 @@ args = TrainingArguments(
     weight_decay=0.1,
     warmup_ratio=0.03,                  # 3% warmup
     lr_scheduler_type="cosine",
-    logging_steps=100,
-    save_steps=1000,
     save_total_limit=3,                 # 最多保留 3 个 checkpoint
     fp16=True,                          # 混合精度
     tf32=True,                          # Ampere 以上显卡加速
-    dataloader_num_workers=4,
+    dataloader_num_workers=1,
     remove_unused_columns=False,        # 必须设为 False，否则 HF 会删掉我们的数据列
     gradient_checkpointing=True,        # 省显存（会慢一点）
     optim="adamw_torch_fused",  # fused AdamW（更快）
@@ -116,10 +122,11 @@ trainer = Trainer(
     train_dataset=tokenized_dataset,
     # eval_dataset=...  # 如果有验证集可以加上
 )
+if __name__ == '__main__':
+    print(f"模型参数量: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    # ========== 6. 开始训练 ==========
+    trainer.train()
 
-# ========== 6. 开始训练 ==========
-trainer.train()
-
-# 保存最终模型
-trainer.save_model("./qwen2_pretrain_final")
-tokenizer.save_pretrained("./qwen2_pretrain_final")
+    # 保存最终模型
+    trainer.save_model("./qwen2_pretrain_final")
+    tokenizer.save_pretrained("./qwen2_pretrain_final")

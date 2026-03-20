@@ -99,8 +99,8 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsequeeze(unsqueeze_dim)
-    sin = sin.unsequeeze(unsqueeze_dim)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -117,7 +117,7 @@ def repeat_kv(hidden_states, n_rep):
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def eager_attention_forward(module, query, key, value, attention_mask, scaling, dropout):
+def eager_attention_forward(module, query, key, value, attention_mask, scaling, dropout, **kwargs):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
@@ -145,21 +145,21 @@ class Qwen2Attention(nn.Module):
         self.head_dim = getattr(
             config, 'head_dim', config.num_hiddens // config.num_heads)
         self.num_key_value_groups = config.num_heads // config.num_key_value_heads
-        self.scaling = self.head_dim ** 0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.q_proj = nn.Linear(
             config.num_hiddens, config.num_heads * self.head_dim, bias=True)
         self.k_proj = nn.Linear(
-            config.num_hiddens, config.num_heads * self.head_dim, bias=True)
+            config.num_hiddens, config.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(
-            config.num_hiddens, config.num_heads * self.head_dim, bias=True)
+            config.num_hiddens, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(
-            config.num_heads * self.head_dim, config.num_hiddens, bias=True)
+            config.num_heads * self.head_dim, config.num_hiddens, bias=False)
         self.sliding_window = config.sliding_window if config.layer_types[
             layer_idx] == 'sliding_attention' else None
 
-    def forward(self, hidden_states, positon_embedings, attention_mask, past_key_values, cache_position, **kwargs):
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -170,7 +170,7 @@ class Qwen2Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(
             hidden_shape).transpose(1, 2)
 
-        cos, sin = positon_embedings
+        cos, sin = position_embeddings
 
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin)
@@ -190,7 +190,8 @@ class Qwen2Attention(nn.Module):
             value_states,
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.sliding_window,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # main diff with Llama
             **kwargs
         )
 
@@ -324,6 +325,8 @@ class DecoderModel(PreTrainedModel):
                                  DecoderBlock(config, i))
         self.dense = nn.Linear(config.num_hiddens, config.vocab_size)
         self.gradient_checkpointing = False
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
 
     def forward(
         self,
@@ -341,7 +344,7 @@ class DecoderModel(PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embedding(input_ids)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
